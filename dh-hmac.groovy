@@ -8,118 +8,153 @@ import javax.crypto.spec.*;
 import javax.crypto.interfaces.*;
 import com.sun.crypto.provider.SunJCE;
 import javax.xml.bind.DatatypeConverter
+import java.nio.channels.*;
+import java.util.concurrent.CountDownLatch
 
-AlgorithmParameterGenerator paramGen = AlgorithmParameterGenerator.getInstance("DH");
-paramGen.init(512);
-AlgorithmParameters params = paramGen.generateParameters();
-DHParameterSpec dhSkipParamSpec = (DHParameterSpec)params.getParameterSpec (DHParameterSpec.class);
+def Pipe pipe= Pipe.open();
+final DataOutputStream sinkStream= new DataOutputStream(Channels.newOutputStream(pipe.sink().configureBlocking(true)));
+final DataInputStream sourceStream= new DataInputStream(Channels.newInputStream(pipe.source().configureBlocking(true)));
+def latch= new CountDownLatch(2)
 
-System.out.println("ALICE: Generate DH keypair ...");
-KeyPairGenerator aliceKpairGen = KeyPairGenerator.getInstance("DH");
-aliceKpairGen.initialize(dhSkipParamSpec);
-KeyPair aliceKpair = aliceKpairGen.generateKeyPair();
+class Alice implements Runnable {
+    DataOutputStream sinkStream
+    DataInputStream sourceStream
+    String message;
+    CountDownLatch latch;
 
-// Alice creates and initializes her DH KeyAgreement object
-System.out.println("ALICE: Initialization ...");
-KeyAgreement aliceKeyAgree = KeyAgreement.getInstance("DH");
-aliceKeyAgree.init(aliceKpair.getPrivate());
-
-// Alice encodes her public key, and sends it over to Bob.
-byte[] alicePubKeyEnc = aliceKpair.getPublic().getEncoded();
-
-/*
- * Let's turn over to Bob. Bob has received Alice's public key
- * in encoded format.
- * He instantiates a DH public key from the encoded key material.
- */
-KeyFactory bobKeyFac = KeyFactory.getInstance("DH");
-X509EncodedKeySpec x509KeySpec = new X509EncodedKeySpec(alicePubKeyEnc);
-PublicKey alicePubKey = bobKeyFac.generatePublic(x509KeySpec);
-
-/*
- * Bob gets the DH parameters associated with Alice's public key.
- * He must use the same parameters when he generates his own key
- * pair.
- */
-DHParameterSpec dhParamSpec = ((DHPublicKey)alicePubKey).getParams();
-
-// Bob creates his own DH key pair
-System.out.println("BOB: Generate DH keypair ...");
-KeyPairGenerator bobKpairGen = KeyPairGenerator.getInstance("DH");
-bobKpairGen.initialize(dhParamSpec);
-KeyPair bobKpair = bobKpairGen.generateKeyPair();
-
-// Bob creates and initializes his DH KeyAgreement object
-System.out.println("BOB: Initialization ...");
-KeyAgreement bobKeyAgree = KeyAgreement.getInstance("DH");
-bobKeyAgree.init(bobKpair.getPrivate());
-
-// Bob encodes his public key, and sends it over to Alice.
-byte[] bobPubKeyEnc = bobKpair.getPublic().getEncoded();
-
-/*
- * Alice uses Bob's public key for the first (and only) phase
- * of her version of the DH
- * protocol.
- * Before she can do so, she has to instantiate a DH public key
- * from Bob's encoded key material.
- */
-KeyFactory aliceKeyFac = KeyFactory.getInstance("DH");
-x509KeySpec = new X509EncodedKeySpec(bobPubKeyEnc);
-PublicKey bobPubKey = aliceKeyFac.generatePublic(x509KeySpec);
-System.out.println("ALICE: Execute PHASE1 ...");
-aliceKeyAgree.doPhase(bobPubKey, true);
-
-/*
- * Bob uses Alice's public key for the first (and only) phase
- * of his version of the DH
- * protocol.
- */
-System.out.println("BOB: Execute PHASE1 ...");
-bobKeyAgree.doPhase(alicePubKey, true);
-
-/*
- * At this stage, both Alice and Bob have completed the DH key
- * agreement protocol.
- * Both generate the (same) shared secret.
- */
-byte[] aliceSharedSecret = aliceKeyAgree.generateSecret();
-int aliceLen = aliceSharedSecret.length;
-
-byte[] bobSharedSecret = new byte[aliceLen];
-int bobLen;
-try {
-    // show example of what happens if you
-    // provide an output buffer that is too short
-    bobLen = bobKeyAgree.generateSecret(bobSharedSecret, 1);
-} catch (ShortBufferException e) {
-    System.out.println(e.getMessage());
+    @Override
+    public void run() {
+        try {
+            AlgorithmParameterGenerator paramGen = AlgorithmParameterGenerator.getInstance("DH");
+            paramGen.init(512);
+            AlgorithmParameters params = paramGen.generateParameters();
+            DHParameterSpec dhSkipParamSpec = (DHParameterSpec)params.getParameterSpec (DHParameterSpec.class);
+            
+            System.out.println("ALICE: Generate DH keypair ...");
+            KeyPairGenerator aliceKpairGen = KeyPairGenerator.getInstance("DH");
+            aliceKpairGen.initialize(dhSkipParamSpec);
+            KeyPair aliceKpair = aliceKpairGen.generateKeyPair();
+            
+            // Alice creates and initializes her DH KeyAgreement object
+            System.out.println("ALICE: Initialization ...");
+            KeyAgreement aliceKeyAgree = KeyAgreement.getInstance("DH");
+            aliceKeyAgree.init(aliceKpair.getPrivate());
+            
+            // Alice encodes her public key, and sends it over to Bob.
+            byte[] alicePubKeyEnc = aliceKpair.getPublic().getEncoded();
+            sinkStream.writeInt(alicePubKeyEnc.length);
+            sinkStream.write(alicePubKeyEnc, 0, alicePubKeyEnc.length);
+    
+            int inboundLen= sourceStream.readInt();
+            byte[] bobPubKeyEnc= new byte[inboundLen]
+            sourceStream.readFully(bobPubKeyEnc, 0, inboundLen);
+    
+            /*
+             * Alice uses Bob's public key for the first (and only) phase
+             * of her version of the DH
+             * protocol.
+             * Before she can do so, she has to instantiate a DH public key
+             * from Bob's encoded key material.
+             */
+            KeyFactory aliceKeyFac = KeyFactory.getInstance("DH");
+            def x509KeySpec = new X509EncodedKeySpec(bobPubKeyEnc);
+            PublicKey bobPubKey = aliceKeyFac.generatePublic(x509KeySpec);
+            System.out.println("ALICE: Execute PHASE1 ...");
+            aliceKeyAgree.doPhase(bobPubKey, true);
+    
+            SecretKeySpec aliceSigningKey= new SecretKeySpec(aliceKeyAgree.generateSecret(), "HmacSHA512")
+            Mac aliceMac= Mac.getInstance("HmacSHA512")
+            aliceMac.init(aliceSigningKey)
+    
+            byte[] aliceResult= aliceMac.doFinal(message.getBytes());
+            sinkStream.writeInt(aliceResult.length)
+            sinkStream.write(aliceResult, 0, aliceResult.length);
+            sinkStream.writeUTF(message);
+            
+            println "Bob said: "+sourceStream.readUTF()
+        }
+        finally {
+            latch.countDown()
+        }
+    }
 }
-// provide output buffer of required size
-bobLen = bobKeyAgree.generateSecret(bobSharedSecret, 0);
 
-System.out.println("Alice secret: " + aliceSharedSecret.encodeHex());
-System.out.println("Bob secret: " + bobSharedSecret.encodeHex());
+class Bob implements Runnable {
+    DataOutputStream sinkStream
+    DataInputStream sourceStream
+    CountDownLatch latch;
 
-if (!java.util.Arrays.equals(aliceSharedSecret, bobSharedSecret))
-    throw new Exception("Shared secrets differ");
-System.out.println("Shared secrets are the same");
+    @Override
+    public void run() {
+        try {
+            int inboundLen= sourceStream.readInt();
+            byte[] alicePubKeyEnc= new byte[inboundLen]
+            sourceStream.readFully(alicePubKeyEnc, 0, inboundLen);
+            /*
+             * Let's turn over to Bob. Bob has received Alice's public key
+             * in encoded format.
+             * He instantiates a DH public key from the encoded key material.
+             */
+            KeyFactory bobKeyFac = KeyFactory.getInstance("DH");
+            X509EncodedKeySpec x509KeySpec = new X509EncodedKeySpec(alicePubKeyEnc);
+            PublicKey alicePubKey = bobKeyFac.generatePublic(x509KeySpec);
+    
+            /*
+             * Bob gets the DH parameters associated with Alice's public key.
+             * He must use the same parameters when he generates his own key
+             * pair.
+             */
+            DHParameterSpec dhParamSpec = ((DHPublicKey)alicePubKey).getParams();
+    
+            // Bob creates his own DH key pair
+            System.out.println("BOB: Generate DH keypair ...");
+            KeyPairGenerator bobKpairGen = KeyPairGenerator.getInstance("DH");
+            bobKpairGen.initialize(dhParamSpec);
+            KeyPair bobKpair = bobKpairGen.generateKeyPair();
+    
+            // Bob creates and initializes his DH KeyAgreement object
+            System.out.println("BOB: Initialization ...");
+            KeyAgreement bobKeyAgree = KeyAgreement.getInstance("DH");
+            bobKeyAgree.init(bobKpair.getPrivate());
+    
+            // Bob encodes his public key, and sends it over to Alice.
+            byte[] bobPubKeyEnc = bobKpair.getPublic().getEncoded();
+            sinkStream.writeInt(bobPubKeyEnc.length);
+            sinkStream.write(bobPubKeyEnc, 0, bobPubKeyEnc.length);
+    
+            /*
+             * Bob uses Alice's public key for the first (and only) phase
+             * of his version of the DH
+             * protocol.
+             */
+            System.out.println("BOB: Execute PHASE1 ...");
+            bobKeyAgree.doPhase(alicePubKey, true);
+    
+            SecretKeySpec bobSigningKey= new SecretKeySpec(bobKeyAgree.generateSecret(), "HmacSHA512")
+            Mac bobMac= Mac.getInstance("HmacSHA512")
+            bobMac.init(bobSigningKey)
+    
+            
+            byte[] aliceResult= new byte[sourceStream.readInt()];
+            sourceStream.readFully(aliceResult)
+            def message = sourceStream.readUTF();
+            
+            byte[] bobResult= bobMac.doFinal(message.getBytes())
+            assert aliceResult == bobResult
+            sinkStream.writeUTF("OK")
+        }
+        finally {
+            latch.countDown()
+        }
+    }
+}
 
-bobKeyAgree.doPhase(alicePubKey, true);
+Thread t1= new Thread(new Alice(message: "The quick brown fox jumped over the lazy dog", sinkStream: sinkStream, sourceStream: sourceStream, latch: latch))
+Thread t2= new Thread(new Bob(sinkStream: sinkStream, sourceStream: sourceStream, latch: latch))
+t1.start()
+t2.start()
 
-SecretKeySpec bobSigningKey= new SecretKeySpec(bobKeyAgree.generateSecret(), "HmacSHA512")
-Mac bobMac= Mac.getInstance("HmacSHA512")
-bobMac.init(bobSigningKey)
-
-aliceKeyAgree.doPhase(bobPubKey, true);
-SecretKeySpec aliceSigningKey= new SecretKeySpec(aliceKeyAgree.generateSecret(), "HmacSHA512")
-Mac aliceMac= Mac.getInstance("HmacSHA512")
-aliceMac.init(aliceSigningKey)
-
-byte[] aliceResult= aliceMac.doFinal("The quick brown fox jumped over the lazy dog".getBytes());
-
-byte[] bobResult= bobMac.doFinal("The quick brown fox jumped over the lazy dog".getBytes())
-assert aliceResult == bobResult
+latch.await()
 println "done"
 
 
